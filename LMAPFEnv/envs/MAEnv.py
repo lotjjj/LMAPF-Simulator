@@ -17,66 +17,59 @@ from .rendering import WarehouseWidget, WarehouseMainWindow
 
 
 class TaskStatus(Enum):
-    """任务状态枚举"""
-    ACTIVE = 0      # 活跃（未完成）
-    COMPLETED = 1    # 已完成
-    ABANDONED = 2    # 已放弃
+    """Task status enumeration"""
+    ACTIVE = 0      # Active (not completed)
+    COMPLETED = 1    # Completed
+    ABANDONED = 2    # Abandoned
 
 
 class Task:
-    """任务类 - AGV 需要到达的目标位置"""
+    """Task class - target position for AGV"""
     def __init__(self, target_pos: Tuple[int, int], status: TaskStatus = TaskStatus.ACTIVE):
-        self.target_pos = target_pos  # 目标坐标 (x, y)
-        self.status = status  # 任务状态
-        self.assigned_agent = None  # 分配的 agent_id
+        self.target_pos = target_pos  # Target coordinate (x, y)
+        self.status = status  # Task status
+        self.assigned_agent = None  # Assigned agent_id
 
 
 class Tasks:
-    """任务管理单例"""
+    """Task manager singleton"""
     _instance = None
-    _initialized = False
+    _lock = None
 
-    def __new__(cls, *args, **kwargs):
+    def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._initialized = True
+            cls._instance.tasks: Dict[int, Task] = {}
+            cls._lock = True
         return cls._instance
-
-    def __init__(self):
-        if Tasks._initialized:
-            return
-
-        # 存储所有任务: {agent_id: Task}
-        self.tasks: Dict[int, Task] = {}
 
     @classmethod
     def reset(cls):
-        """重置任务管理器"""
+        """Reset task manager"""
         if cls._instance is not None:
             cls._instance.tasks.clear()
 
     def add_task(self, agent_id: int, target_pos: Tuple[int, int]):
-        """为 AGV 添加任务"""
+        """Add task for AGV"""
         self.tasks[agent_id] = Task(target_pos, TaskStatus.ACTIVE)
 
     def get_task(self, agent_id: int) -> Optional[Task]:
-        """获取 AGV 的任务"""
+        """Get AGV task"""
         return self.tasks.get(agent_id)
 
     def update_task_status(self, agent_id: int, status: TaskStatus):
-        """更新任务状态"""
+        """Update task status"""
         if agent_id in self.tasks:
             self.tasks[agent_id].status = status
 
-    def assign_random_target(self, agent_id: int, passable_positions: list):
-        """为 AGV 分配随机目标位置"""
-        import random
-        target_pos = random.choice(passable_positions)
+    def assign_random_target(self, agent_id: int, passable_positions: list, rng):
+        """Assign random target position for AGV"""
+        target_pos = rng.choice(passable_positions)
         self.add_task(agent_id, target_pos)
         return target_pos
 
     def is_task_completed(self, agent_id: int, current_pos: Tuple[int, int]) -> bool:
-        """检查任务是否完成"""
+        """Check if task is completed"""
         task = self.tasks.get(agent_id)
         if task is None or task.status != TaskStatus.ACTIVE:
             return False
@@ -95,7 +88,7 @@ class BatteryConfig:
 
 @dataclass
 class MapConfig:
-    shelf_cols: int = 2  # Number of shelf columns
+    shelf_cols: int = 3  # Number of shelf columns
     shelf_rows: int = 3  # Number of shelf rows
     shelf_width: int = 3  # Single shelf width (grid cells)
     shelf_height: int = 2  # Single shelf height (grid cells)
@@ -107,7 +100,7 @@ class WarehouseEnv(ParallelEnv):
     """Warehouse AGV simulation environment"""
     metadata = {"render_modes": ["human", "rgb_array"], "name": "warehouse_v0"}
 
-    def __init__(self, num_agvs=32,  fov_size=5, render_mode=None, enable_battery=False,
+    def __init__(self, num_agvs=6,  fov_size=5, render_mode=None, enable_battery=False,
                  battery_config: Optional[BatteryConfig] = BatteryConfig(),
                  map_config: Optional[MapConfig] = MapConfig(),
                  max_episode_steps=500):
@@ -167,17 +160,17 @@ class WarehouseEnv(ParallelEnv):
         # Passable positions for random target assignment
         self._passable_positions = self._get_passable_positions()
 
-        # Episode计数器
-        self._episode_count = 0  # Episode计数器
-        self._current_step = 0  # Reset step counter
+        # Episode counter
+        self._episode_count = 0
+        self._current_step = 0
 
-        # Seed管理
-        self._seed = None  # 当前seed
-        self._rng_state = None  # 随机数生成器状态
+        # Seed management
+        self._seed = None
+        self._rng_state = None
         self.np_random = None
 
-        # 任务奖励值
-        self.task_completion_reward = 10.0  # 完成任务的奖励
+        # Task reward
+        self.task_completion_reward = 10.0
 
         self._action_space = Discrete(4)
         self._observation_space = self._create_observation_space()
@@ -186,8 +179,8 @@ class WarehouseEnv(ParallelEnv):
             self._init_render_window()
 
     def _calculate_map_size(self):
-        # 计算货架区域的总宽度和高度
-        # 当 shelf_cols 或 shelf_rows 为 0 时，不放置货架
+        # Calculate total width and height of shelf area
+        # No shelves when shelf_cols or shelf_rows is 0
         if self.shelf_cols > 0:
             total_shelf_width = self.shelf_cols * self.shelf_width + (self.shelf_cols - 1) * self.corridor_width
         else:
@@ -210,17 +203,17 @@ class WarehouseEnv(ParallelEnv):
             for x in range(self.width):
                 grid = None
 
-                # 边界墙
+                # Boundary walls
                 if x == 0 or x == self.width - 1 or y == 0 or y == self.height - 1:
                     grid = Wall(x, y)
                 else:
-                    # 检查是否在充电区（紧邻墙壁，宽度为1）
+                    # Check if in charging area (adjacent to walls, width=1)
                     if self.enable_battery and self._is_charging_area(x, y):
                         grid = ChargingStation(x, y)
-                    # 检查是否在货架区（居中布局）
+                    # Check if in shelf area (centered layout)
                     elif self._is_shelf_area(x, y):
                         grid = Shelf(x, y)
-                    # 其他是走廊
+                    # Others are corridors
                     else:
                         grid = Corridor(x, y)
 
@@ -229,31 +222,31 @@ class WarehouseEnv(ParallelEnv):
         return grid_map
 
     def _is_shelf_area(self, x, y):
-        """检查位置是否在货架区域 - 货架居中布局"""
-        # 如果没有货架，直接返回False
+        """Check if position is in shelf area - centered layout"""
+        # Return False if no shelves
         if self.shelf_cols <= 0 or self.shelf_rows <= 0:
             return False
         
-        # 外部过道宽度
+        # Outer corridor width
         outer_margin = self.corridor_out_width
 
-        # 计算货架区域的总宽度和高度
+        # Calculate total shelf width and height
         total_shelf_width = self.shelf_cols * self.shelf_width + (self.shelf_cols - 1) * self.corridor_width
         total_shelf_height = self.shelf_rows * self.shelf_height + (self.shelf_rows - 1) * self.corridor_width
 
-        # 如果空间太小，不放置货架
+        # No shelves if space too small
         if total_shelf_width > self.width - 2 - 2 * outer_margin or \
                 total_shelf_height > self.height - 2 - 2 * outer_margin:
             return False
 
-        # 计算货架区域的起始位置（居中）
+        # Calculate shelf area start position (centered)
         shelf_area_width = self.width - 2 - 2 * outer_margin
         shelf_area_height = self.height - 2 - 2 * outer_margin
 
         start_x = outer_margin + 1 + (shelf_area_width - total_shelf_width) // 2
         start_y = outer_margin + 1 + (shelf_area_height - total_shelf_height) // 2
 
-        # 检查是否在任何货架区域内
+        # Check if in any shelf area
         for shelf_row in range(self.shelf_rows):
             for shelf_col in range(self.shelf_cols):
                 shelf_start_x = start_x + shelf_col * (self.shelf_width + self.corridor_width)
@@ -266,40 +259,40 @@ class WarehouseEnv(ParallelEnv):
         return False
 
     def _is_charging_area(self, x, y):
-        """检查位置是否在充电区域（紧邻墙壁，宽度为1）"""
-        # 充电桩宽度恒为1，紧邻外围墙壁
-        # 上边缘（y=1）
+        """Check if position is in charging area (adjacent to walls, width=1)"""
+        # Charging station width is 1, adjacent to outer walls
+        # Top edge (y=1)
         if y == 1 and 0 < x < self.width - 1:
             return True
-        # 下边缘（y=height-2）
+        # Bottom edge (y=height-2)
         if y == self.height - 2 and 1 < x < self.width - 1:
             return True
-        # 左边缘（x=1）
+        # Left edge (x=1)
         if x == 1 and 1 < y < self.height - 1:
             return True
-        # 右边缘（x=width-2）
+        # Right edge (x=width-2)
         if x == self.width - 2 and 1 < y < self.height - 1:
             return True
 
         return False
 
     def _initialize_agvs(self):
-        """初始化AGV位置、电量和朝向"""
+        """Initialize AGV positions, battery, and direction"""
         for i in range(self.num_agvs):
-            # 随机选择一个可占用的位置
+            # Randomly select an occupiable position
             while True:
                 x = self.np_random.integers(1, self.width - 2)
                 y = self.np_random.integers(1, self.height - 2)
                 if self.grid_map[y][x].occupiable and len(self.grid_map[y][x].agvs) == 0:
-                    # 随机初始化电量（0.5到1.0之间）
+                    # Randomly initialize battery (0.5 to 1.0)
                     battery_level = self.np_random.uniform(0.5, 1.0)
-                    # 使用 Direction 枚举初始化方向
+                    # Use Direction enum to initialize direction
                     direction = list(Direction)[self.np_random.integers(0, 4)]
                     
                     agv = AGV(i, (x, y), battery_level=battery_level, direction=direction)
                     self.agvs[f"agv_{i}"] = agv
                     self.grid_map[y][x].add_agv(agv)
-                    # 更新位置索引
+                    # Update position index
                     self._agv_positions[i] = (x, y)
                     break
 
@@ -357,12 +350,12 @@ class WarehouseEnv(ParallelEnv):
         # 初始化所有动作为可用: [Forward, TurnLeft, TurnRight, Stop]
         mask = [1, 1, 1, 1]
 
-        # 检查Forward动作是否可用
-        # 根据当前方向计算前进位置，使用 Direction.get_delta())
+        # Check if Forward action is available
+        # Calculate forward position based on current direction, using Direction.get_delta()
         dx, dy = agv.direction.get_delta()
         new_x, new_y = x + dx, y + dy
 
-        # 检查边界
+        # Check boundaries
         if not (0 <= new_x < self.width and 0 <= new_y < self.height):
             mask[Action.FORWARD.value] = 0
         else:
@@ -371,10 +364,10 @@ class WarehouseEnv(ParallelEnv):
 
             if not target_grid.passable:
                 mask[Action.FORWARD.value] = 0
-            # 检查货架间移动限制
+            # Check shelf-to-shelf movement restriction
             elif isinstance(target_grid, Shelf) and isinstance(current_grid, Shelf):
                 mask[Action.FORWARD.value] = 0
-            # 检查AGV冲突
+            # Check AGV conflict
             elif len(target_grid.agvs) > 0:
                 mask[Action.FORWARD.value] = 0
 
@@ -382,31 +375,31 @@ class WarehouseEnv(ParallelEnv):
 
     def teleport_agv(self, agent_name, x, y):
         """
-        安全地将 AGV 传送到指定位置（用于测试/调试）
+        Safely teleport AGV to specified position (for testing/debugging)
 
         Args:
-            agent_name: AGV 名称 (e.g., "agv_0")
-            x: 目标 x 坐标
-            y: 目标 y 坐标
+            agent_name: AGV name (e.g., "agv_0")
+            x: Target x coordinate
+            y: Target y coordinate
         """
         if agent_name not in self.agvs:
             return
 
         agv = self.agvs[agent_name]
 
-        # 从旧位置移除 AGV
+        # Remove AGV from old position
         old_grid = self.grid_map[agv.y][agv.x]
         old_grid.remove_agv(agv)
 
-        # 更新 AGV 位置
+        # Update AGV position
         agv.x = x
         agv.y = y
 
-        # 添加到新位置
+        # Add to new position
         new_grid = self.grid_map[y][x]
         new_grid.add_agv(agv)
 
-        # 更新位置索引
+        # Update position index
         self._agv_positions[agv.id] = (x, y)
 
     def reset(self, seed=None, options=None):
@@ -709,7 +702,7 @@ class WarehouseEnv(ParallelEnv):
         return observations, rewards, self._agent_terminations, self._agent_truncations, infos
 
     def _get_target_position_static(self, agv):
-        """获取目标位置（静态检查用）- 不实际移动AGV"""
+        """Get target position (for static checks) - does not move AGV"""
         dx, dy = agv.direction.get_delta()
         new_x = agv.x + dx
         new_y = agv.y + dy
@@ -816,7 +809,7 @@ class WarehouseEnv(ParallelEnv):
         return hanging_reward + task_completion_reward
 
     def _get_passable_positions(self):
-        """获取所有可通用的位置列表"""
+        """Get list of all passable positions"""
         passable_positions = []
         for y in range(self.height):
             for x in range(self.width):
@@ -825,28 +818,28 @@ class WarehouseEnv(ParallelEnv):
         return passable_positions
 
     def _assign_tasks(self):
-        """为所有 AGV 分配任务"""
+        """Assign tasks to all AGVs"""
         tasks = Tasks()
         for agent_name, agv in self.agvs.items():
-            # 为每个 AGV 分配一个随机目标
-            target_pos = tasks.assign_random_target(agv.id, self._passable_positions)
-            # 更新 AGV 的 target_pos 属性
+            # Assign a random target for each AGV
+            target_pos = tasks.assign_random_target(agv.id, self._passable_positions, self.np_random)
+            # Update AGV's target_pos attribute
             agv.target_pos = target_pos
 
     def _check_task_completion(self):
-        """检查任务完成情况并更新"""
+        """Check task completion and update"""
         tasks = Tasks()
         for agent_name, agv in self.agvs.items():
             task = tasks.get_task(agv.id)
             if task is not None and task.status == TaskStatus.ACTIVE:
-                # 检查是否到达目标位置
-                if (agv.x, agv.y) == task.target_pos:
-                    # 标记任务完成
+                # Check if reached target position
+                if agv.x == task.target_pos[0] and agv.y == task.target_pos[1]:
+                    # Mark task as completed
                     tasks.update_task_status(agv.id, TaskStatus.COMPLETED)
                     print(f"[Task Completed] Agent {agent_name} reached target at {task.target_pos}")
 
-                    # 分配新任务
-                    new_target = tasks.assign_random_target(agv.id, self._passable_positions)
+                    # Assign new task
+                    new_target = tasks.assign_random_target(agv.id, self._passable_positions, self.np_random)
                     agv.target_pos = new_target
 
     def render(self):

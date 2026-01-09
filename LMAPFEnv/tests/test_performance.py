@@ -1,6 +1,4 @@
-"""
-性能测试脚本 - 测试8AGVs环境下的运行速度
-"""
+
 import time
 
 import numpy as np
@@ -9,13 +7,10 @@ from LMAPFEnv.envs.MAEnv import WarehouseEnv, BatteryConfig, MapConfig
 
 
 def test_performance():
-    """测试8AGVs环境下的运行性能"""
     print("=" * 60)
     print("开始性能测试 - 8 AGVs with Rendering")
     print("=" * 60)
 
-    
-    # 创建环境配置
     battery_config = BatteryConfig(
         energy_decay=0.005,
         energy_decay_noise=0.002,

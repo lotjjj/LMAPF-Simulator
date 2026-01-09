@@ -2,14 +2,16 @@
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.hatch.build.targets.wheel]
+packages = ["LMAPFEnv"]
+
 [project]
-name = "lmapf-simulator"
+name = "LMAPFEnv"
 version = "0.1.0"
 description = "Multi-Agent Path Finding Simulator for warehouse AGV environments"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
-authors = [{name = "Your Name", email = "your.email@example.com"}]
 keywords = ["multi-agent", "path-finding", "warehouse", "AGV", "pettingzoo"]
 
 dependencies = [
@@ -20,16 +22,3 @@ dependencies = [
     "PySide6>=6.4.0",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0.0",
-    "pytest-cov>=4.0.0",
-]
-
-[project.urls]
-Homepage = "https://github.com/yourusername/lmapf-simulator"
-Repository = "https://github.com/yourusername/lmapf-simulator"
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["LMAPFEnv*"]

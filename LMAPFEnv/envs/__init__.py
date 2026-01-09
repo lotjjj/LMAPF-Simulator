@@ -1,4 +1,4 @@
-from .MAEnv import WarehouseEnv, BatteryConfig, MapConfig
+from .MAEnv import WarehouseEnv, BatteryConfig, MapConfig, Tasks, Task, TaskStatus
 from .entities import AGV, Grid, Wall, Shelf, Corridor, ChargingStation
 
 __all__ = [
@@ -10,5 +10,8 @@ __all__ = [
     'Corridor',
     'ChargingStation',
     'BatteryConfig',
-    'MapConfig'
+    'MapConfig',
+    'Tasks',
+    'Task',
+    'TaskStatus'
 ]
