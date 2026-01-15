@@ -1,0 +1,12 @@
+# LMAPF-Simulator Requirements
+# Python version: >=3.10
+
+# Core dependencies
+numpy>=1.21.0
+networkx>=2.6.0
+pettingzoo>=1.22.0
+gymnasium>=0.26.0
+PySide6>=6.4.0
+
+# Build dependencies (optional, for package development)
+# hatchling
