@@ -165,7 +165,7 @@ class InfoPanel(QWidget):
         layout.setContentsMargins(20, 20, 20, 20)
         
         # Title
-        title_label = QLabel("📊 Warehouse Status")
+        title_label = QLabel("Warehouse Status")
         title_label.setStyleSheet("""
             color: #ffffff;
             font-size: 18px;
