@@ -1,0 +1,54 @@
+# IDE / editors
+.idea/
+.vscode/
+.trae/
+.qoder/
+.git/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# C++ / CMake build output
+build/
+**/build/
+*.pyd
+*.pyd.old
+*.pyd.old1
+*.obj
+*.lib
+*.exp
+*.iobj
+*.ipdb
+*.recipe
+CMakeCache.txt
+CMakeFiles/
+*.vcxproj*
+*.sln
+*.filters
+cmake_install.cmake
+CMakeConfigureLog.yaml
+
+# Scratch / debug scripts (run from repo root)
+scratch/
+tests/
+
+# Model weights / experiment outputs
+models/
+runs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

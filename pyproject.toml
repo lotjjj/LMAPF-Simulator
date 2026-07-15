@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["LMAPFEnv"]
+
+[project]
+name = "LMAPFEnv"
+version = "0.1.0"
+description = "Multi-Agent Path Finding Simulator for warehouse AGV environments"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "MIT"}
+keywords = ["multi-agent", "path-finding", "warehouse", "AGV", "pettingzoo"]
+
+dependencies = [
+    "numpy>=1.21.0",
+    "pettingzoo>=1.22.0",
+    "gymnasium>=0.26.0",
+    "pygame>=2.5.0",
+    "matplotlib>=3.8.0",
+    "imageio[ffmpeg]>=2.34.0",
+]
+
