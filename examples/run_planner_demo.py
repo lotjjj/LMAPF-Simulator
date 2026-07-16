@@ -16,9 +16,9 @@ from LMAPFEnv.utils import parse_planner_args
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a simple planner-driven warehouse simulation demo.")
-    parser.add_argument("--num-agvs", type=int, default=5)
+    parser.add_argument("--num-agvs", type=int, default=20)
     parser.add_argument("--map-size", type=str, default="long")
-    parser.add_argument("--path-planner", type=str, default="AStar")
+    parser.add_argument("--path-planner", type=str, default="RHCR")
     parser.add_argument("--planner-args", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--steps", type=int, default=200)

@@ -4,6 +4,8 @@
 
 Ambiente di simulazione multi-AGV per magazzini, pensato per la ricerca su **Lifelong Multi-Agent Path Finding (LMAPF/MAPF)**. Basato su PettingZoo `ParallelEnv` e Gymnasium, con planner intercambiabili e varianti rolling-horizon.
 
+![demo](./renders/demo.gif)
+
 <video src="./renders/episode_demo.mp4" controls muted loop playsinline></video>
 
 [Guardare la demo MP4](./renders/episode_demo.mp4)
@@ -20,7 +22,7 @@ Il progetto deriva da [RWARE](https://github.com/semitable/robotic-warehouse). A
 
 ## Funzionalità
 
-- Interfaccia **PettingZoo `ParallelEnv`**
+- Interfaccia **[PettingZoo](https://github.com/Farama-Foundation/PettingZoo/) `ParallelEnv`**
 - Mappe di magazzino integrate: preset `small`, `medium`, `large`, `long`
 - Coda continua di task: nuovi task assegnati automaticamente al raggiungimento del target
 - Risoluzione dei conflitti: lo step dell'ambiente usa un grafo diretto per risolvere conflitti runtime senza intervento del planner, con motore **C++ FastGraph**

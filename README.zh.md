@@ -4,6 +4,8 @@
 
 仓储多 AGV 仿真环境，面向**终身多智能体路径规划（LMAPF/MAPF）** 研究。基于 PettingZoo `ParallelEnv` 与 Gymnasium，支持可插拔规划器与滚动窗口变体。
 
+![demo](./renders/demo.gif)
+
 <video src="./renders/episode_demo.mp4" controls muted loop playsinline></video>
 
 [查看 MP4 演示](./renders/episode_demo.mp4)
@@ -20,7 +22,7 @@ python tools/save_episode_video.py
 
 ## 特点
 
-- **PettingZoo `ParallelEnv`** 多智能体接口
+- **[PettingZoo](https://github.com/Farama-Foundation/PettingZoo/) `ParallelEnv`** 多智能体接口
 - **内置仓储地图**：`small` / `medium` / `large` / `long` 四种预设
 - **持续任务队列**：到达目标后自动分配新任务
 - **冲突裁决**：环境层的有向图 step 自动处理运行时冲突，无需规划器介入，基于 **C++ FastGraph 引擎**
