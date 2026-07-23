@@ -125,6 +125,45 @@ for _ in range(200):
 env.close()
 ```
 
+### 无副作用的额外路径规划查询
+
+在 `reset()` 或任意一次完整的 `step()` 之后，可调用 `query_paths()` 基于
+当前 AGV 位置和任务快照额外执行一次规划。每次查询都会创建全新的临时
+planner，因此不会推进、重置或覆盖环境的主 planner 和可选观测 planner；
+即使环境内部使用的也是 RHCR，内部 RHCR 状态也不会改变。
+
+```python
+result = env.query_paths(
+    "RHCR",
+    {"planning_window": 10, "horizon": 5, "max_low_level_steps": 200},
+    timeout=2.0,
+)
+
+if result.success:
+    external_paths = result.paths  # {"agv_0": [(x0, y0), ...], ...}
+else:
+    print(result.failure_reason)  # "timed_out" 或 "no_paths"
+```
+
+接口签名：
+
+```python
+env.query_paths(
+    planner_type,
+    planner_args=None,
+    *,
+    timeout=None,
+    use_current_constraints=True,
+) -> PathQueryResult
+```
+
+- 必须在环境调用之间同步执行，不能与 `step()` 或 `reset()` 并发。
+- 查询 planner 设置 `k_robust > 0` 时，`use_current_constraints=True`
+  会只读复制主 planner 已执行路径产生的初始约束。
+- 返回路径是独立的 `(x, y)` 列表，调用方可自由修改。
+- 未知 planner 参数会直接报错，不会被静默忽略。
+- 首次 `reset()` 之前调用会抛出 `RuntimeError`。
+
 ### 4. 运行基准测试
 
 ```bash
@@ -258,7 +297,7 @@ obs = Dict({
 
 - `terminations[agent]` 始终为 `False`。
 - 当达到 `max_episode_steps` 时，所有存活 agent 的 `truncations[agent]` 变为 `True`。
-- 若拥堵窗口内超过半数 agent 停留在同一位置，环境也会截断所有存活 agent。
+- 拥堵或 STAY 动作不会导致 episode 截断。
 - 本步被终止或截断的 agent 会在下一步前从 `env.agents` 中移除。
 
 ### 默认奖励

@@ -125,6 +125,47 @@ for _ in range(200):
 env.close()
 ```
 
+### Side-effect-free planner query
+
+After `reset()` or any completed `step()`, `query_paths()` can run one
+additional planner against the current AGV/task snapshot. A fresh planner is
+created for every query, so the environment's main planner and optional
+observation planner are not advanced, reset, or overwritten—even when either
+one is itself RHCR.
+
+```python
+result = env.query_paths(
+    "RHCR",
+    {"planning_window": 10, "horizon": 5, "max_low_level_steps": 200},
+    timeout=2.0,
+)
+
+if result.success:
+    external_paths = result.paths  # {"agv_0": [(x0, y0), ...], ...}
+else:
+    print(result.failure_reason)  # "timed_out" or "no_paths"
+```
+
+Signature:
+
+```python
+env.query_paths(
+    planner_type,
+    planner_args=None,
+    *,
+    timeout=None,
+    use_current_constraints=True,
+) -> PathQueryResult
+```
+
+- Call it synchronously between environment calls, not concurrently with
+  `step()` or `reset()`.
+- With query `k_robust > 0`, `use_current_constraints=True` read-only copies
+  executed-path constraints from the main planner.
+- Returned `(x, y)` lists are detached and caller-mutable.
+- Unknown planner arguments are rejected instead of silently ignored.
+- Calling before the first `reset()` raises `RuntimeError`.
+
 ### 4. Run benchmark
 
 ```bash
@@ -258,7 +299,7 @@ This means:
 
 - `terminations[agent]` is always `False`.
 - `truncations[agent]` becomes `True` for all alive agents when `max_episode_steps` is reached.
-- The environment also truncates all alive agents if more than half of them remain at the same position over the congestion window.
+- Congestion or STAY actions do not truncate the episode.
 - Agents marked terminated or truncated in a step are removed from `env.agents` before the next step.
 
 ### Default reward

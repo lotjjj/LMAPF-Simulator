@@ -24,8 +24,7 @@ ENV/
 build/
 **/build/
 *.pyd
-*.pyd.old
-*.pyd.old1
+*.pyd.old*
 *.obj
 *.lib
 *.exp
@@ -43,6 +42,9 @@ CMakeConfigureLog.yaml
 # Scratch / debug scripts (run from repo root)
 scratch/
 tests/
+!tests/
+tests/*
+!tests/test_query_paths.py
 
 # Model weights / experiment outputs
 models/

@@ -1,14 +1,16 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any, Dict, Optional, Tuple, List
 from typing import Literal
-from collections import deque, OrderedDict
+from collections import OrderedDict
 import time
 import warnings
 import numpy as np
 from gymnasium.utils import seeding
 
-from .entities import AGV, Wall, Shelf, Corridor, Action, TaskStatus, Tasks, Position
+from .entities import AGV, Wall, Shelf, Corridor, Action, TaskStatus, Position
+from .task_manager import TaskManager, TargetPool, TargetMode, RandomTargetSampler
 from ..algorithms.path_planners import create_path_planner, PathPlannerBase
+from ..planning_query import PathQueryResult
 from ..configBase import (
     LegacyRewardConfig,
     PlannerConfigBase,
@@ -68,14 +70,9 @@ class WarehouseEnvBase:
                  planner_args: Optional[Dict] = None,
                  num_visible_tasks: Optional[int] = None,
                  kstep_conflict_check: Optional[int] = None,
-                 task_assignment_mode: str = 'random',
+                 targets_only_on_shelf: bool = True,
+                 padding_path_enable: bool = True,
                  ):
-
-        # Validate task_assignment_mode
-        if task_assignment_mode not in ('random', 'proximity'):
-            raise ValueError(
-                f"task_assignment_mode must be 'random' or 'proximity', got '{task_assignment_mode}'"
-            )
 
         # Backward compat: kstep_conflict_check is deprecated alias for path_window
         if kstep_conflict_check is not None:
@@ -89,7 +86,12 @@ class WarehouseEnvBase:
         if map_size not in PRESET_MAPS:
             raise ValueError(f"map_size must be one of {list(PRESET_MAPS.keys())}, got '{map_size}'")
 
-        self.task_assignment_mode = task_assignment_mode
+        self.targets_only_on_shelf = bool(targets_only_on_shelf)
+        # padding_path_enable: when a planner path is shorter than
+        # path_window + 1, controls whether info['planner_paths']['path_abs']
+        # is padded (by repeating the last position) up to the fixed length.
+        # When disabled, the raw (shorter) path is exposed as-is.
+        self.padding_path_enable = bool(padding_path_enable)
         self.num_agvs = num_agvs
         self.render_mode = render_mode
         self.max_episode_steps = max_episode_steps
@@ -145,9 +147,7 @@ class WarehouseEnvBase:
         self._agv_grid = np.full((self.height, self.width), -1, dtype=np.int32)
         self._agent_at = np.full(self.height * self.width, -1, dtype=np.int32)
 
-        self._passable_positions = self._get_passable_positions()
-        self._task_target_positions = self._get_task_target_positions()
-        self._validate_task_capacity()
+        self._target_pool = TargetPool(self._shelf_mask, self._passable_mask)
 
         r = self.fov_radius
         pad_h = self.height + 2 * r
@@ -198,7 +198,13 @@ class WarehouseEnvBase:
         self._conflicted_agents = None
         
         # Instance-level task manager (not global singleton)
-        self._tasks = Tasks()
+        self.task_manager = TaskManager(
+            agvs=self.agvs,
+            pool=self._target_pool,
+            sampler=RandomTargetSampler(),
+            num_visible_tasks=self.num_visible_tasks,
+            mode=TargetMode.from_targets_only_on_shelf(self.targets_only_on_shelf),
+        )
 
         self._initialize_agvs()
         self._render_prev_positions = self._snapshot_positions() if self.render_mode else {}
@@ -249,6 +255,9 @@ class WarehouseEnvBase:
                 "obs_planner_timing_detail": {},
                 "planner_disabled": False,
                 "planner_disable_reason": "",
+                "planner_replanned": False,
+                "planner_partial_replan": False,
+                "planner_replanned_agents": [],
             }
 
         self._profile_data = [0] * 9
@@ -257,8 +266,6 @@ class WarehouseEnvBase:
         self._graph_engine = _CppFastGraph(self._graph_capacity)
 
         self._held_endpoints: Dict[Position, str] = {}  # pos → agent_name
-        self._position_history: Dict[str, deque] = {}  # agent → deque of Position
-
         self._step_distance_cache: Dict[Tuple[int, int, int, int], Optional[int]] = {}
 
     def _build_planner(self, planner_type, planner_args: Optional[Dict] = None) -> Optional[PathPlannerBase]:
@@ -276,6 +283,158 @@ class WarehouseEnvBase:
             planner.set_grid_data(self._passable_mask, self._shelf_mask)
             planner.set_planning_window(self.path_window)
         return planner
+
+    def query_paths(
+        self,
+        planner_type: str,
+        planner_args: Optional[Dict] = None,
+        *,
+        timeout: Optional[float] = None,
+        use_current_constraints: bool = True,
+    ) -> PathQueryResult:
+        """Run one isolated planning query against the current environment state.
+
+        A fresh planner and detached AGV snapshots are used for every call.
+        Consequently this method does not change the environment, the main
+        path planner, or the optional observation planner.  It is intended to
+        be called synchronously between ``step`` calls.
+
+        Parameters
+        ----------
+        planner_type:
+            Registered planner name, such as ``"AStar"`` or ``"RHCR"``.
+        planner_args:
+            Overrides accepted by that planner's config. Unknown keys raise
+            ``ValueError`` so misspelled experimental settings are not ignored.
+        timeout:
+            Optional per-query wall-clock limit in seconds. The planner's own
+            smaller limit, when present, still applies.
+        use_current_constraints:
+            For a query planner with ``k_robust > 0``, copy initial constraints
+            derived from the main planner's already-executed path prefix.
+
+        Returns
+        -------
+        PathQueryResult
+            Detached paths keyed by public agent name plus query diagnostics.
+
+        Raises
+        ------
+        RuntimeError
+            If the environment has not been reset yet.
+        ValueError, TypeError
+            If the planner name or query arguments are invalid.
+
+        Notes
+        -----
+        This method is side-effect-free but not thread-safe with concurrent
+        ``step`` or ``reset`` calls; those could change the sampled state while
+        the temporary planner is running.
+        """
+        if self._episode_count <= 0:
+            raise RuntimeError("query_paths() requires reset() to be called first")
+        if not isinstance(planner_type, str) or not planner_type:
+            raise ValueError("planner_type must be a non-empty planner name")
+        if planner_args is not None and not isinstance(planner_args, dict):
+            raise TypeError("planner_args must be a dict or None")
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or timeout <= 0
+        ):
+            raise ValueError("timeout must be a positive number of seconds or None")
+        if not isinstance(use_current_constraints, bool):
+            raise TypeError("use_current_constraints must be a bool")
+
+        cfg = get_default_planner_config(planner_type)
+        query_args = dict(planner_args or {})
+        allowed_args = {item.name for item in fields(cfg)} - {"planner_type"}
+        unknown_args = sorted(set(query_args) - allowed_args)
+        if unknown_args:
+            raise ValueError(
+                f"Unknown {planner_type} planner_args: {', '.join(unknown_args)}"
+            )
+
+        planner = self._build_planner(planner_type, query_args)
+        if planner is None:  # Defensive; validated planner names always build one.
+            raise ValueError(f"Unable to create planner: {planner_type}")
+
+        # Do not expose the environment-owned numpy arrays to query planners.
+        planner.set_grid_data(self._passable_mask.copy(), self._shelf_mask.copy())
+        planner.enable_timing()
+
+        source_agvs, target_positions, goal_sequences = self._collect_planner_inputs()
+        query_agvs: Dict[int, AGV] = {}
+        id_to_name: Dict[int, str] = {}
+        for agent_name, source in self.agvs.items():
+            if source.id not in source_agvs:
+                continue
+            snapshot = AGV(
+                source.id,
+                source.position.to_tuple(),
+                fov_size=source.fov_size,
+                path_window=source.path_window,
+            )
+            snapshot.target_pos = source.target_pos
+            snapshot.req_action = source.req_action
+            snapshot.status = source.status
+            query_agvs[source.id] = snapshot
+            id_to_name[source.id] = agent_name
+
+        planner.set_goal_sequences(goal_sequences)
+        query_k_robust = int(getattr(planner, "k_robust", 0))
+        if (
+            use_current_constraints
+            and query_k_robust > 0
+            and hasattr(planner, "set_initial_constraints")
+        ):
+            planner.set_initial_constraints(
+                self._build_initial_constraints(query_k_robust)
+            )
+
+        deadline = None if timeout is None else time.time() + float(timeout)
+        started = time.perf_counter()
+        raw_paths = planner.plan_multi_agent(
+            query_agvs, target_positions, deadline=deadline
+        ) if target_positions else {}
+        planning_time_ms = (time.perf_counter() - started) * 1000.0
+
+        expected_ids = set(target_positions)
+        success = bool(planner.is_last_plan_successful()) and all(
+            raw_paths.get(agent_id) for agent_id in expected_ids
+        )
+
+        planner_budget = getattr(planner, "MAX_PLANNING_TIME", None)
+        effective_budget = float(timeout) if timeout is not None else None
+        if planner_budget is not None:
+            planner_budget = float(planner_budget)
+            effective_budget = (
+                planner_budget
+                if effective_budget is None
+                else min(effective_budget, planner_budget)
+            )
+        timed_out = bool(
+            not success
+            and effective_budget is not None
+            and planning_time_ms >= effective_budget * 900.0
+        )
+        failure_reason = None if success else ("timed_out" if timed_out else "no_paths")
+
+        detached_paths = {
+            id_to_name[agent_id]: [(int(pos.x), int(pos.y)) for pos in path]
+            for agent_id, path in raw_paths.items()
+            if agent_id in id_to_name
+        }
+        return PathQueryResult(
+            planner_type=planner_type,
+            current_step=int(self._current_step),
+            success=success,
+            paths=detached_paths,
+            planning_time_ms=float(planning_time_ms),
+            timed_out=timed_out,
+            failure_reason=failure_reason,
+            timing_detail=dict(planner.last_timing or {}),
+        )
 
 
     def _get_observation_planner(self) -> Optional[PathPlannerBase]:
@@ -332,20 +491,16 @@ class WarehouseEnvBase:
         target_positions = {}
         goal_sequences: Dict[int, List[Position]] = {}
 
-        tasks = self._tasks
         pw = self.path_window
         for agent_name, agv in self.agvs.items():
             if agent_name in self.agents:
-                current = tasks.get_current_task(agv.id)
+                current = self.task_manager.current_task(agv.id)
                 if current and current.status == TaskStatus.ACTIVE:
                     agv_dict[agv.id] = agv
                     target_positions[agv.id] = current.target_pos
                     # Collect full task goal sequence for multi-goal planning
                     # (goal_id as state dimension in low-level A*/SIPP)
-                    all_tasks = list(tasks.tasks.get(agv.id, []))
-                    active_tasks = [t for t in all_tasks if t.status == TaskStatus.ACTIVE]
-                    active_tasks = active_tasks[: self.num_visible_tasks]
-                    goals = [Position(*t.target_pos) for t in active_tasks]
+                    goals = self.task_manager.goal_sequence(agv.id)
 
                     # Predict how many goals the planner needs.
                     # Budget = pw * 4: generous enough for multi-goal
@@ -602,8 +757,6 @@ class WarehouseEnvBase:
         self._render_current_positions[agent_name] = new_pos
 
     def reset(self, seed=None, options=None):
-        self._tasks.reset()
-
         self._seed(seed=seed)
 
         self._episode_count += 1
@@ -616,15 +769,13 @@ class WarehouseEnvBase:
         self._planner_timeout_cooldown = 0
         self._planner_goal_sequences_snapshot.clear()
         self._held_endpoints.clear()
-        self._position_history.clear()
-
         self._initialize_agvs()
         self._render_prev_positions = self._snapshot_positions() if self.render_mode else {}
         self._render_current_positions = self._snapshot_positions() if self.render_mode else {}
         self.agents = self.possible_agents[:]
         self._agent_terminations = {agent: False for agent in self.possible_agents}
         self._agent_truncations = {agent: False for agent in self.possible_agents}
-        self._assign_tasks()
+        self.task_manager.reset(self.np_random)
         
         self._plan_paths()
         self._plan_observation_paths()
@@ -680,15 +831,20 @@ class WarehouseEnvBase:
         # slice [agv.y : agv.y+2r+1, agv.x : agv.x+2r+1] is always in bounds.
         tile = self._padded_tile_codes[agv.y:agv.y + fov_size, agv.x:agv.x + fov_size]
         agv_presence = self._padded_agv_grid[agv.y:agv.y + fov_size, agv.x:agv.x + fov_size]
-        target = self._padded_target_grid[agv.y:agv.y + fov_size, agv.x:agv.x + fov_size]
-
         # Fill FOV channels in-place using pre-allocated buffer
         fov[0] = (tile == 0)       # corridor
         fov[1] = (tile == 1)       # wall / oob
         fov[2] = (tile == 2)       # shelf
         # other AGVs: present AND not self
         fov[3] = (agv_presence >= 0) & (agv_presence != agv.id)
-        fov[4] = target
+        # Only expose this agent's current goal.  Other agents' goals and
+        # future entries in the ego task queue are not part of its FOV.
+        fov[4].fill(0.0)
+        if agv.target_pos is not None:
+            dx = int(agv.target_pos.x - agv.x)
+            dy = int(agv.target_pos.y - agv.y)
+            if abs(dx) <= r and abs(dy) <= r:
+                fov[4, r + dy, r + dx] = 1.0
 
         return fov
 
@@ -733,15 +889,19 @@ class WarehouseEnvBase:
                 # PlannerPolicy can compute the next action from info alone.
                 if seq[0] != agv.position:
                     seq = [agv.position] + seq
-            # Truncate or pad to exactly target_len (path_window + 1)
+            # Truncate to at most target_len (path_window + 1).
             if len(seq) > target_len:
                 seq = seq[:target_len]
-            elif len(seq) < target_len and seq:
+            # Pad short paths to exactly target_len by repeating the last
+            # position, unless padding is disabled (expose raw path as-is).
+            elif self.padding_path_enable and len(seq) < target_len and seq:
                 seq = seq + [seq[-1]] * (target_len - len(seq))
-            path_abs = self._path_info_bufs[agent_name]
+            buf = self._path_info_bufs[agent_name]
             for idx, pos in enumerate(seq):
-                path_abs[idx, 0] = float(pos.x)
-                path_abs[idx, 1] = float(pos.y)
+                buf[idx, 0] = float(pos.x)
+                buf[idx, 1] = float(pos.y)
+            # When not padded, expose only the filled portion of the buffer.
+            path_abs = buf if len(seq) == target_len else buf[:len(seq)]
             out[agent_name] = {
                 "path_abs": path_abs,
                 "alive": bool(agent_name in alive_agents),
@@ -872,6 +1032,9 @@ class WarehouseEnvBase:
                 "obs_timing_detail": info.get("obs_planner_timing_detail", {}),
                 "disabled": bool(info.get("planner_disabled", False)),
                 "disable_reason": str(info.get("planner_disable_reason", "")),
+                "replanned": bool(info.get("planner_replanned", False)),
+                "partial_replan": bool(info.get("planner_partial_replan", False)),
+                "replanned_agents": list(info.get("planner_replanned_agents", [])),
             }
         # Issue 5: copy path_abs to avoid exposing the pre-allocated buffer
         paths_info = self._get_cached_planner_paths_info().get(agent, {})
@@ -917,7 +1080,6 @@ class WarehouseEnvBase:
 
         # ── Phase 4: Task completion & replan decision ────────────────
         self._current_step += 1
-        self._record_position_history()
         if self._current_step >= self.max_episode_steps:
             for agent in self.agents:
                 self._agent_truncations[agent] = True
@@ -931,7 +1093,6 @@ class WarehouseEnvBase:
         if _p is not None:
             _p[3] = time.perf_counter_ns()  # end deviance
 
-        self._update_task()
         initial_constraints = self._prepare_replan_data(replan_flag)
 
         if replan_flag:
@@ -947,12 +1108,7 @@ class WarehouseEnvBase:
         if _p is not None:
             _p[4] = time.perf_counter_ns()  # end planning
 
-        # ── Phase 6: Congestion detection ─────────────────────────────
-        if self._check_congested(window=10):
-            for agent in self.agents:
-                self._agent_truncations[agent] = True
-
-        # ── Phase 7: Rewards, info, observations ──────────────────────
+        # ── Phase 6: Rewards, info, observations ──────────────────────
         rewards = self._compute_rewards(
             old_positions, invalid_actions, reward_targets, task_completed_flags
         )
@@ -1130,13 +1286,14 @@ class WarehouseEnvBase:
         """Phase 4: Check task completion and prepare reward data."""
         reward_targets = {}
         task_completed_flags = {}
-        tasks = self._tasks
         for agent in self.agents:
             agv = self.agvs[agent]
-            task = tasks.get_current_task(agv.id)
+            task = self.task_manager.current_task(agv.id)
             reward_targets[agent] = task.target_pos if task is not None else agv.target_pos
 
-        completed_agents = self._check_task_completion()
+        completed_agents = self.task_manager.process_completions(self.np_random)
+        if completed_agents:
+            self._update_target_grid()
         for agent in self.agents:
             task_completed_flags[agent] = agent in completed_agents
         return reward_targets, task_completed_flags, completed_agents
@@ -1180,10 +1337,15 @@ class WarehouseEnvBase:
             obs_replan_flag = obs_replan_flag or (self._current_step % obs_interval == 0)
 
         # Path sufficiency check
-        sufficiency_due = self._should_replan_for_path_sufficiency()
-        if sufficiency_due:
+        insufficient_agents = self._agents_needing_replan_for_path_sufficiency()
+        if insufficient_agents:
             replan_flag = True
-            partial_replan_agents = None
+            if self._planner_supports_partial_replan(self.path_planner_type) and not periodic_due:
+                if partial_replan_agents is None:
+                    partial_replan_agents = set()
+                partial_replan_agents.update(insufficient_agents)
+            else:
+                partial_replan_agents = None
 
         return replan_flag, obs_replan_flag, partial_replan_agents
 
@@ -1223,8 +1385,8 @@ class WarehouseEnvBase:
             deviated_agents.add(agent)
         return deviated_agents
 
-    def _should_replan_for_path_sufficiency(self) -> bool:
-        """Check if any alive agent needs replanning due to insufficient path.
+    def _agents_needing_replan_for_path_sufficiency(self) -> set[str]:
+        """Return alive agents needing replanning due to insufficient path.
 
         Replan is needed when remaining path length < path_window + 1
         and the current task queue differs from, or is not covered by, the
@@ -1233,9 +1395,9 @@ class WarehouseEnvBase:
         shorter than the window, replanning with the same inputs cannot help.
         """
         if not self.path_planner:
-            return False
+            return set()
         pw = self.path_window
-        tasks = self._tasks
+        insufficient_agents: set[str] = set()
         for agent in self.agents:
             if self._agent_terminations.get(agent, False):
                 continue
@@ -1244,31 +1406,31 @@ class WarehouseEnvBase:
             head = self.path_planner.get_path_head(agv.id)
             remaining_len = len(path) - head if path else 0
             if remaining_len < pw + 1:
-                current_seq = tuple(
-                    Position(*task.target_pos)
-                    for task in list(tasks.tasks.get(agv.id, []))[: self.num_visible_tasks]
-                    if task.status == TaskStatus.ACTIVE
-                )
+                current_seq = tuple(self.task_manager.goal_sequence(agv.id))
                 if not current_seq:
                     continue
                 if not path:
-                    return True
+                    insufficient_agents.add(agent)
+                    continue
 
                 planned_seq = self._planner_goal_sequences_snapshot.get(agv.id, tuple())
                 if current_seq != planned_seq:
-                    return True
+                    insufficient_agents.add(agent)
+                    continue
 
                 final_goal = planned_seq[-1] if planned_seq else current_seq[-1]
                 if path[-1] != final_goal:
-                    return True
-        return False
+                    insufficient_agents.add(agent)
+        return insufficient_agents
+
+    def _should_replan_for_path_sufficiency(self) -> bool:
+        """Return whether any alive agent needs replanning due to insufficient path."""
+        return bool(self._agents_needing_replan_for_path_sufficiency())
 
     def _prepare_replan_data(self, replan_flag: bool) -> Optional[Dict]:
         """Phase 5b: Build constraints and predictive tasks for replanning."""
         initial_constraints = None
         if replan_flag and self._planner_uses_periodic_replan(self.path_planner_type) and self.path_planner is not None:
-            pw = getattr(self.path_planner, 'planning_window', 10)
-            self._predict_and_assign_tasks(pw)
             k_robust = self.planner_args.get('k_robust', 0)
             if k_robust > 0:
                 initial_constraints = self._build_initial_constraints(k_robust)
@@ -1291,10 +1453,13 @@ class WarehouseEnvBase:
             info["obs_planner_timing_detail"] = {}
             info["planner_disabled"] = bool(self._planner_disabled)
             info["planner_disable_reason"] = self._planner_disabled_reason
+            info["planner_replanned"] = False
+            info["planner_partial_replan"] = False
+            info["planner_replanned_agents"] = []
             info.pop("_planner_meta_cached", None)
 
     def _compute_rewards(self, old_positions, invalid_actions, reward_targets, task_completed_flags) -> Dict:
-        """Phase 7a: Compute rewards for all agents."""
+        """Phase 6a: Compute rewards for all agents."""
         rewards = {}
         for agent in self.agents:
             rewards[agent] = self._calculate_reward(
@@ -1308,7 +1473,7 @@ class WarehouseEnvBase:
 
     def _update_info_cache(self, reward_targets, old_positions, invalid_actions,
                            completed_agents, act_val_time_ms):
-        """Phase 7b: Update per-agent info cache with step results."""
+        """Phase 6b: Update per-agent info cache with step results."""
         for agent in self.agents:
             reward_target = reward_targets.get(agent)
             d_prev = self._distance_to_target(
@@ -1464,288 +1629,11 @@ class WarehouseEnvBase:
             task_completed=task_completed,
         )
 
-    def _get_passable_positions(self):
-        """Return all passable positions on the map."""
-        passable_positions = []
-        for y in range(self.height):
-            for x in range(self.width):
-                if not self.grid_map[y][x].passable:
-                    continue
-                passable_positions.append(Position(x, y))
-        return passable_positions
-
-    def _get_task_target_positions(self):
-        """Return all shelf cells that may host generated tasks."""
-        target_positions = []
-        for y in range(self.height):
-            for x in range(self.width):
-                if self._shelf_mask[y, x]:
-                    target_positions.append(Position(x, y))
-        return target_positions
-
-    def _validate_task_capacity(self):
-        """Ensure the configured visible task queues fit in shelf task cells."""
-        shelf_count = len(self._task_target_positions)
-        required_targets = self.num_agvs * self.num_visible_tasks
-        if required_targets > shelf_count:
-            max_agvs = shelf_count // self.num_visible_tasks
-            raise ValueError(
-                "Task generation requires num_agvs * num_visible_tasks <= shelf_count "
-                f"(task sequence length = num_visible_tasks). Got num_agvs={self.num_agvs}, "
-                f"num_visible_tasks={self.num_visible_tasks}, required={required_targets}, "
-                f"shelf_count={shelf_count}. Set num_agvs <= {max_agvs} for this map/task length."
-            )
-
-    def _get_occupied_positions(self) -> set[Position]:
-        """Return positions currently occupied by live AGVs."""
-        return {
-            self.agvs[agent].position
-            for agent in self.agents
-            if agent in self.agvs
-        }
-
-    def _sample_task_target_position(self, exclude: Optional[set] = None) -> Position:
-        """Sample a shelf task target outside ``exclude`` when possible."""
-        if exclude is None:
-            exclude = set()
-        positions = self._task_target_positions
-        for _ in range(64):
-            pos = self.np_random.choice(positions)
-            if pos not in exclude:
-                return pos
-        candidates = [pos for pos in positions if pos not in exclude]
-        if candidates:
-            return candidates[int(self.np_random.integers(0, len(candidates)))]
-        return self.np_random.choice(positions)
-
-    def _task_targets_exhausted(self, exclude: set) -> bool:
-        """Return whether every shelf task target is blocked by ``exclude``."""
-        return all(pos in exclude for pos in self._task_target_positions)
-
     def _snapshot_positions(self) -> Dict[str, Position]:
         return {
             agent_name: Position(self.agvs[agent_name]._x, self.agvs[agent_name]._y)
             for agent_name in self.possible_agents
         }
-
-    def _assign_tasks(self):
-        tasks = self._tasks
-        # Track assigned targets to avoid giving same target to multiple agents
-        assigned_targets: set = set()
-        occupied_positions = self._get_occupied_positions()
-        for agent_name in sorted(self.agvs.keys()):
-            agv = self.agvs[agent_name]
-            assigned_count = 0
-            if self.task_assignment_mode == 'proximity':
-                # Proximity-based assignment: prefer nearby targets to reduce travel
-                candidates = self._get_nearby_task_target_positions(
-                    agv.position,
-                    count=self.num_visible_tasks * 5,
-                    exclude=assigned_targets | occupied_positions,
-                )
-                for target_pos in candidates:
-                    if assigned_count >= self.num_visible_tasks:
-                        break
-                    tasks.add_task(agv.id, target_pos)
-                    assigned_targets.add(target_pos)
-                    assigned_count += 1
-            # Random assignment (default) or fallback for proximity mode
-            while assigned_count < self.num_visible_tasks:
-                unavailable = assigned_targets | occupied_positions
-                target_pos = self._sample_task_target_position(unavailable)
-                if target_pos not in unavailable:
-                    tasks.add_task(agv.id, target_pos)
-                    assigned_targets.add(target_pos)
-                    assigned_count += 1
-                elif self._task_targets_exhausted(unavailable):
-                    # All positions exhausted, allow duplicates as last resort
-                    tasks.add_task(agv.id, target_pos)
-                    assigned_count += 1
-            current = tasks.get_current_task(agv.id)
-            agv.target_pos = Position(*current.target_pos) if current else None
-
-    def _check_task_completion(self) -> set[str]:
-        completed_agents: set[str] = set()
-        tasks = self._tasks
-        r = self.fov_radius
-        # Build global set of all active task targets for cross-agent dedup
-        all_assigned: set = set()
-        for q in tasks.tasks.values():
-            for t in q:
-                if t.status == TaskStatus.ACTIVE:
-                    all_assigned.add(t.target_pos)
-        occupied_positions = self._get_occupied_positions()
-        for agent_name, agv in self.agvs.items():
-            current = tasks.get_current_task(agv.id)
-            if current is not None and current.status == TaskStatus.ACTIVE:
-                if agv.position == current.target_pos:
-                    old_tp = current.target_pos
-                    self._target_grid[old_tp.y, old_tp.x] = 0.0
-                    self._padded_target_grid[old_tp.y + r, old_tp.x + r] = 0.0
-
-                    # Pop completed task and generate new one at tail
-                    q = tasks.tasks.get(agv.id)
-                    if q:
-                        q.popleft()
-                    # Remove completed target from global set
-                    all_assigned.discard(old_tp)
-                    # Generate new task at tail to maintain queue length
-                    if self.task_assignment_mode == 'proximity':
-                        candidates = self._get_nearby_task_target_positions(
-                            agv.position,
-                            count=5,
-                            exclude=all_assigned | occupied_positions,
-                        )
-                        if candidates:
-                            idx = int(self.np_random.integers(0, len(candidates)))
-                            new_target = candidates[idx]
-                            tasks.add_task(agv.id, new_target.to_tuple())
-                            all_assigned.add(new_target)
-                        else:
-                            target_pos = self._sample_task_target_position(
-                                all_assigned | occupied_positions
-                            )
-                            tasks.add_task(agv.id, target_pos)
-                            all_assigned.add(target_pos)
-                    else:
-                        unavailable = all_assigned | occupied_positions
-                        target_pos = self._sample_task_target_position(unavailable)
-                        if target_pos not in unavailable:
-                            tasks.add_task(agv.id, target_pos)
-                            all_assigned.add(target_pos)
-                        else:
-                            # Fallback: allow duplicate if all positions taken
-                            tasks.add_task(agv.id, target_pos)
-                            all_assigned.add(target_pos)
-                    # Update target_pos to new current task
-                    new_current = tasks.get_current_task(agv.id)
-                    agv.target_pos = Position(*new_current.target_pos) if new_current else None
-
-                    if agv.target_pos is not None:
-                        self._target_grid[agv.target_pos.y, agv.target_pos.x] = 1.0
-                        self._padded_target_grid[agv.target_pos.y + r, agv.target_pos.x + r] = 1.0
-
-                    completed_agents.add(agent_name)
-        return completed_agents
-
-    def _update_task(self):
-        tasks = self._tasks
-        # Build global set of all active task targets for cross-agent dedup
-        all_assigned: set = set()
-        for q in tasks.tasks.values():
-            for t in q:
-                if t.status == TaskStatus.ACTIVE:
-                    all_assigned.add(t.target_pos)
-        occupied_positions = self._get_occupied_positions()
-        for agent in self.agents:
-            agv = self.agvs[agent]
-            needed = self.num_visible_tasks - tasks.task_count(agv.id)
-            if needed > 0:
-                if self.task_assignment_mode == 'proximity':
-                    candidates = self._get_nearby_task_target_positions(
-                        agv.position,
-                        count=needed * 3,
-                        exclude=all_assigned | occupied_positions,
-                    )
-                    for target_pos in candidates[:needed]:
-                        tasks.add_task(agv.id, target_pos)
-                        all_assigned.add(target_pos)
-                # Random fallback (default) or when proximity didn't fill enough
-                while tasks.task_count(agv.id) < self.num_visible_tasks:
-                    unavailable = all_assigned | occupied_positions
-                    target_pos = self._sample_task_target_position(unavailable)
-                    if target_pos not in unavailable or self._task_targets_exhausted(unavailable):
-                        tasks.add_task(agv.id, target_pos)
-                        all_assigned.add(target_pos)
-
-    def _predict_and_assign_tasks(self, planning_window: int):
-        """Predict task completions within planning_window and pre-assign new tasks.
-
-        Following the official RHCR design (KivaSystem::update_goal_locations):
-        estimate how many tasks each agent will complete during the next planning
-        window using Manhattan distance, then assign additional tasks so the
-        planner always has enough goals to plan through the full window.
-        """
-        tasks = self._tasks
-        # Global exclude set shared across all agents to avoid duplicate targets
-        global_assigned: set = set()
-        for q in tasks.tasks.values():
-            for t in q:
-                if t.status == TaskStatus.ACTIVE:
-                    global_assigned.add(t.target_pos)
-        occupied_positions = self._get_occupied_positions()
-        for agent in self.agents:
-            agv = self.agvs[agent]
-            # Estimate total steps to consume all queued tasks
-            all_tasks = list(tasks.tasks.get(agv.id, []))
-            if not all_tasks:
-                continue
-
-            estimated_steps = 0
-            current_pos = agv.position
-            for task in all_tasks:
-                target = task.target_pos
-                if isinstance(target, tuple):
-                    target = Position(*target)
-                dist = abs(current_pos.x - target.x) + abs(current_pos.y - target.y)
-                estimated_steps += max(1, dist)
-                current_pos = target
-
-            # If agent will finish all tasks within the window, add more
-            while estimated_steps <= planning_window:
-                new_target = self._find_predictive_target(
-                    agv, global_assigned | occupied_positions
-                )
-                if new_target is None:
-                    break
-                tasks.add_task(agv.id, new_target)
-                global_assigned.add(new_target)
-                dist = abs(current_pos.x - new_target.x) + abs(current_pos.y - new_target.y)
-                estimated_steps += max(1, dist)
-                current_pos = new_target
-
-    def _find_predictive_target(self, agv: AGV, exclude: set) -> Optional[Position]:
-        """Find a new task target for predictive assignment."""
-        if self.task_assignment_mode == 'proximity':
-            candidates = self._get_nearby_task_target_positions(
-                agv.position, count=5, exclude=exclude
-            )
-            if candidates:
-                # Pick randomly from nearby candidates for variety
-                idx = int(self.np_random.integers(0, len(candidates)))
-                return candidates[idx]
-        # Random assignment (default) or proximity fallback
-        if not self._task_targets_exhausted(exclude):
-            return self._sample_task_target_position(exclude)
-        return None
-
-    def _get_nearby_task_target_positions(
-        self, center: Position, count: int = 10, exclude: Optional[set] = None
-    ) -> List[Position]:
-        """Sample shelf task targets near the center, sorted by Manhattan distance.
-
-        Uses random sampling from all task targets with a preference for
-        nearby ones. Returns up to `count` positions sorted by distance.
-        """
-        if exclude is None:
-            exclude = set()
-        positions = self._task_target_positions
-        n = len(positions)
-        if n == 0:
-            return []
-
-        # Sample a batch and sort by distance to prefer nearby
-        sample_size = min(n, max(count * 4, 30))
-        indices = self.np_random.choice(n, size=sample_size, replace=False)
-        scored = []
-        for idx in indices:
-            pos = positions[idx]
-            if pos in exclude:
-                continue
-            dist = abs(pos.x - center.x) + abs(pos.y - center.y)
-            scored.append((dist, pos))
-        scored.sort(key=lambda x: x[0])
-        return [pos for _, pos in scored[:count]]
 
     def _build_initial_constraints(self, k_robust: int = 1) -> Dict[int, List[Tuple[Position, int]]]:
         """Extract constraints from already-executed path portions.
@@ -1799,33 +1687,6 @@ class WarehouseEnvBase:
             if agent_constraints:
                 constraints[agv_id] = agent_constraints
         return constraints
-
-    def _check_congested(self, window: int = 5) -> bool:
-        """Detect if the system is congested (too many traffic jams).
-
-        Following the official RHCR design (BasicSystem::congested):
-        if more than half of agents haven't moved in the last `window` steps,
-        the system is considered congested.
-        """
-        if window <= 1 or self._current_step < window:
-            return False
-        stuck_count = 0
-        for agent in self.agents:
-            history = self._position_history.get(agent, [])
-            if len(history) >= window:
-                current_pos = history[-1]
-                old_pos = history[-window]
-                if current_pos == old_pos:
-                    stuck_count += 1
-        return stuck_count > len(self.agents) / 2
-
-    def _record_position_history(self):
-        """Record current positions for congestion detection."""
-        for agent in self.agents:
-            agv = self.agvs[agent]
-            if agent not in self._position_history:
-                self._position_history[agent] = deque(maxlen=100)
-            self._position_history[agent].append(agv.position)
 
     
     def _plan_paths(
@@ -1977,6 +1838,18 @@ class WarehouseEnvBase:
                     self.path_planner.clear_path(aid)
         else:
             self._prune_planner_paths(self.path_planner, set(agv_dict.keys()))
+
+        replanned_agent_names = (
+            sorted(agent_names)
+            if partial_replan and agent_names is not None
+            else sorted(self.agents)
+        )
+        planned_any = bool(target_positions)
+        for agent in self.agents:
+            self._info_cache[agent]["planner_replanned"] = planned_any
+            self._info_cache[agent]["planner_partial_replan"] = bool(partial_replan)
+            self._info_cache[agent]["planner_replanned_agents"] = replanned_agent_names
+            self._info_cache[agent].pop("_planner_meta_cached", None)
 
     def close(self):
         pass

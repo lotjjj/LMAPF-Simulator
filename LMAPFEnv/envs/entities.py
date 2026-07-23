@@ -225,68 +225,6 @@ class Task:
         self.assigned_agent = None
 
 
-class Tasks:
-    """Task management system with per-agent FIFO task queue.
-    
-    Each environment instance should create its own Tasks instance
-    to avoid state leakage between environments.
-    """
-
-    def __init__(self):
-        self.tasks: Dict[int, deque[Task]] = {}
-
-    def reset(self):
-        """Reset all tasks"""
-        self.tasks.clear()
-
-    def add_task(self, agent_id: int, target_pos: Union[Tuple[int, int], Position]):
-        """Append a new task to the agent's task queue."""
-        if agent_id not in self.tasks:
-            self.tasks[agent_id] = deque()
-        self.tasks[agent_id].append(Task(target_pos, TaskStatus.ACTIVE))
-
-    def get_task(self, agent_id: int) -> Optional[Task]:
-        """Get the current (head) task for agent (backward-compatible alias)."""
-        return self.get_current_task(agent_id)
-
-    def get_current_task(self, agent_id: int) -> Optional[Task]:
-        """Get the current task (head of the queue)."""
-        q = self.tasks.get(agent_id)
-        return q[0] if q else None
-
-    def get_future_tasks(self, agent_id: int, n: int) -> List[Task]:
-        """Get the next n tasks (excluding the current one)."""
-        q = self.tasks.get(agent_id)
-        if not q or len(q) < 2:
-            return []
-        return list(q)[1 : 1 + n]
-
-    def complete_current_and_advance(self, agent_id: int) -> Optional[Task]:
-        """Mark the current task as done, pop it, and return the new current task."""
-        q = self.tasks.get(agent_id)
-        if q:
-            q.popleft()
-            return q[0] if q else None
-        return None
-
-    def update_task_status(self, agent_id: int, status: TaskStatus):
-        """Update the current task's status."""
-        current = self.get_current_task(agent_id)
-        if current is not None:
-            current.status = status
-
-    def task_count(self, agent_id: int) -> int:
-        """Return the number of pending tasks for the agent."""
-        q = self.tasks.get(agent_id)
-        return len(q) if q else 0
-
-    def assign_random_target(self, agent_id: int, passable_positions: list, rng):
-        """Assign a random target position to the agent's task queue."""
-        target_pos = rng.choice(passable_positions)
-        self.add_task(agent_id, target_pos)
-        return target_pos
-
-
 class Grid:
     """Base grid cell class"""
     

@@ -58,7 +58,6 @@ def _count_public_paths(infos: dict, agents) -> int:
 def run_single_planner(
     planner_type: str,
     seed: int = 42,
-    task_assignment_mode: str = "random",
     max_steps: int = DEFAULT_STEPS,
     no_path_patience: int = 2,
 ) -> dict:
@@ -74,7 +73,6 @@ def run_single_planner(
         path_planner=planner_type, planner_args=planner_args,
         render_mode=None,
         max_episode_steps=max_steps,
-        task_assignment_mode=task_assignment_mode,
     )
     obs, info = env.reset(seed=seed)
     policy = PlannerPolicy(env.path_planner)
@@ -220,15 +218,9 @@ def main():
     parser.add_argument("--no-path-patience", type=int, default=2)
     parser.add_argument("--plot", type=Path, default=DEFAULT_PLOT)
     parser.add_argument("--no-plot", action="store_true")
-    parser.add_argument(
-        "--task-assignment", type=str, default="random",
-        choices=["random", "proximity"],
-        help="Task assignment strategy: 'random' (default) or 'proximity'."
-    )
     args = parser.parse_args()
 
     planners = [args.planner] if args.planner else PLANNERS
-    task_assignment_mode = args.task_assignment
     results = []
     for pt in planners:
         if pt not in PLANNERS:
@@ -237,7 +229,6 @@ def main():
         r = run_single_planner(
             pt,
             seed=args.seed,
-            task_assignment_mode=task_assignment_mode,
             max_steps=args.steps,
             no_path_patience=args.no_path_patience,
         )

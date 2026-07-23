@@ -6,6 +6,7 @@ from pettingzoo import ParallelEnv
 
 from .MAEnv_base import WarehouseEnvBase, PRESET_MAPS
 from .rendering import WarehouseWidget, WarehouseMainWindow
+from ..planning_query import PathQueryResult
 
 
 class WarehouseEnv(ParallelEnv, EzPickle):
@@ -31,7 +32,8 @@ class WarehouseEnv(ParallelEnv, EzPickle):
                  if_continuous: bool = True,
                  num_visible_tasks: Optional[int] = None,
                  kstep_conflict_check: Optional[int] = None,
-                 task_assignment_mode: str = 'random'):
+                 targets_only_on_shelf: bool = True,
+                 padding_path_enable: bool = True):
 
         # Backward compat: kstep_conflict_check is deprecated alias for path_window
         if kstep_conflict_check is not None:
@@ -53,7 +55,9 @@ class WarehouseEnv(ParallelEnv, EzPickle):
             planner_args,
             if_continuous,
             num_visible_tasks,
-            task_assignment_mode,
+            None,
+            targets_only_on_shelf,
+            padding_path_enable,
         )
         ParallelEnv.__init__(self)
 
@@ -67,7 +71,8 @@ class WarehouseEnv(ParallelEnv, EzPickle):
             path_window=path_window,
             planner_args=planner_args,
             num_visible_tasks=num_visible_tasks,
-            task_assignment_mode=task_assignment_mode,
+            targets_only_on_shelf=targets_only_on_shelf,
+            padding_path_enable=padding_path_enable,
         )
 
         self.render_mode = render_mode
@@ -130,12 +135,24 @@ class WarehouseEnv(ParallelEnv, EzPickle):
     def path_window(self):
         return self._env.path_window
 
+    @property
+    def num_visible_tasks(self):
+        return self._env.num_visible_tasks
+
+    @property
+    def targets_only_on_shelf(self):
+        return self._env.targets_only_on_shelf
+
+    @property
+    def padding_path_enable(self):
+        return self._env.padding_path_enable
+
     def _get_cached_planner_paths_info(self):
         return self._env._get_cached_planner_paths_info()
 
     @property
-    def _tasks(self):
-        return self._env._tasks
+    def task_manager(self):
+        return self._env.task_manager
 
     def get_agent_info(self, agent_name):
         if agent_name not in self.agvs:
@@ -194,6 +211,22 @@ class WarehouseEnv(ParallelEnv, EzPickle):
             self.render(if_continuous=self.if_continuous)
 
         return observations, rewards, terminations, truncations, infos
+
+    def query_paths(
+        self,
+        planner_type: str,
+        planner_args: Optional[dict] = None,
+        *,
+        timeout: Optional[float] = None,
+        use_current_constraints: bool = True,
+    ) -> PathQueryResult:
+        """Compute paths once without changing environment or planner state."""
+        return self._env.query_paths(
+            planner_type,
+            planner_args,
+            timeout=timeout,
+            use_current_constraints=use_current_constraints,
+        )
 
     def teleport_agv(self, agent_name, x, y):
         return self._env.teleport_agv(agent_name, x, y)

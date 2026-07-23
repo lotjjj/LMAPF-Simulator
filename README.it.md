@@ -258,7 +258,7 @@ Questo significa che:
 
 - `terminations[agent]` è sempre `False`.
 - `truncations[agent]` diventa `True` per tutti gli agent vivi quando viene raggiunto `max_episode_steps`.
-- L'ambiente tronca anche tutti gli agent vivi se più della metà resta nella stessa posizione durante la finestra di congestione.
+- La congestione o le azioni STAY non causano il troncamento dell'episodio.
 - Gli agent marcati come terminated o truncated in uno step vengono rimossi da `env.agents` prima dello step successivo.
 
 ### Reward di default

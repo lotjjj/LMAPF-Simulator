@@ -166,13 +166,13 @@ class WarehouseRenderer:
 
     def _draw_task_targets(self):
         """Draw task targets as light green diamonds"""
-        tasks = self.env._tasks
+        manager = self.env.task_manager
         for agent, agv in self.env.agvs.items():
             agent_info = self.env.get_agent_info(agent)
             if agent_info is not None and agent_info["is_terminated"]:
                 continue
                 
-            task = tasks.get_task(agv.id)
+            task = manager.current_task(agv.id)
             if task is not None and task.status == TaskStatus.ACTIVE:
                 target_x, target_y = task.target_pos.x, task.target_pos.y
                 
