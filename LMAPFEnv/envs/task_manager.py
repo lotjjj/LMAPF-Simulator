@@ -23,7 +23,9 @@ Class relationships::
 
 Key invariants
 --------------
-* Every ACTIVE task in a single AGV queue targets a distinct cell (req. 1).
+* Every ACTIVE task across ALL AGV queues targets a globally distinct cell
+  (global task flow).  The manager maintains ``_global_active_positions`` to
+  enforce this system-wide uniqueness.
 * New tasks are *pushed* by the manager when a task completes; AGVs never pull
   their own tasks (req. 2), which keeps the uniqueness invariant enforceable.
 * Only random assignment is supported (req. 3).
@@ -210,6 +212,10 @@ class TaskManager:
     it can read current positions and write ``agv.target_pos`` directly (the
     push model).  It never scans the grid: candidate targets come from the
     pre-computed :class:`TargetPool`.
+
+    A global task flow (``_global_active_positions``) tracks every active task
+    target across ALL agents so that newly generated tasks never duplicate an
+    existing active task system-wide.
     """
 
     def __init__(
@@ -228,6 +234,8 @@ class TaskManager:
         self._queues: Dict[int, TaskQueue] = {
             agv.id: TaskQueue() for agv in agvs.values()
         }
+        # Global task flow: all active task target positions across all agents.
+        self._global_active_positions: Set[Position] = set()
         available = pool.size(mode)
         if available < self._k:
             raise ValueError(
@@ -241,6 +249,7 @@ class TaskManager:
         """Clear every queue and fill each AGV to ``num_visible_tasks``."""
         for queue in self._queues.values():
             queue.clear()
+        self._global_active_positions.clear()
         for agent_name in sorted(self._agvs.keys()):
             agv = self._agvs[agent_name]
             self._fill(agv, rng)
@@ -261,7 +270,10 @@ class TaskManager:
                 continue
             if agv.position != head.target_pos:
                 continue
-            queue.popleft()
+            done_task = queue.popleft()
+            # Release the completed target from the global task flow.
+            if done_task is not None:
+                self._global_active_positions.discard(done_task.target_pos)
             self._fill(agv, rng)
             self._sync_target(agv)
             completed.add(agent_name)
@@ -290,25 +302,30 @@ class TaskManager:
 
     # -- internals --------------------------------------------------------
     def _fill(self, agv: AGV, rng: np.random.Generator) -> None:
-        """Top the AGV's queue back up to ``num_visible_tasks`` distinct targets."""
+        """Top the AGV's queue back up to ``num_visible_tasks`` distinct targets.
+
+        New tasks are drawn from the global task flow: they must not duplicate
+        any currently active task across ALL agents (global uniqueness), nor
+        the AGV's current cell (soft constraint).
+        """
         queue = self._queues[agv.id]
         need = self._k - len(queue)
         if need <= 0:
             return
         candidates = self._pool.candidates(self._mode)
-        existing = queue.positions
-        # Prefer to also avoid the AGV's current cell (soft constraint).
-        forbidden = existing | {agv.position}
+        # Hard constraint: avoid all globally active targets + own queue.
+        forbidden = self._global_active_positions | {agv.position}
         sampled = self._sampler.sample_distinct(candidates, forbidden, rng, need)
         if len(sampled) < need:
-            # Pool too small to also skip the current cell: relax that soft
-            # constraint but keep the hard queue-uniqueness invariant.
-            forbidden = existing | set(sampled)
+            # Pool too small to also skip the current cell: relax the soft
+            # position constraint but keep global uniqueness.
+            forbidden = self._global_active_positions | set(sampled)
             sampled += self._sampler.sample_distinct(
                 candidates, forbidden, rng, need - len(sampled)
             )
         for pos in sampled:
             queue.append(Task(pos, TaskStatus.ACTIVE))
+            self._global_active_positions.add(pos)
 
     def _sync_target(self, agv: AGV) -> None:
         """Write the head target back onto the AGV (push model)."""
